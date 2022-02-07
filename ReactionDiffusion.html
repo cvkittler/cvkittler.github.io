@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang='en'>
+  <head>
+    <style>body{ margin:0; background:black; }</style>
+    <script src="https://cdn.jsdelivr.net/npm/tweakpane@3.0.7/dist/tweakpane.min.js"></script>
+  </head>
+  <body>
+    <canvas id='gl'></canvas>
+  </body>
+  <!-- vertex shader, as simple as possible -->
+  <script id='vertex' type='x-shader/x-vertex'>
+    attribute vec2 a_position;
+
+    void main() {
+      gl_Position = vec4( a_position, 0, 1 );
+    }
+  </script>
+  
+  <!-- game of life simulation fragment shader -->
+  <script id='simulation' type='x-shader/x-fragment'>
+    #ifdef GL_ES
+    precision mediump float;
+    #endif
+    
+    uniform float time;
+    uniform vec2 resolution;
+    uniform float DiffusionA;
+    uniform float DiffusionB;
+    uniform float kill;
+    uniform float feed ;
+    uniform float XPixelPerPeriod ;
+    uniform float XfeedWeight ;
+    uniform bool Xenabled;
+    uniform float topKillValue ;
+    uniform float bottomKillValue ;
+    uniform bool toggleKillGradiant;
+    uniform float diffusionPeriod;
+    uniform float diffusionState;
+    uniform float diffusionWeight;
+
+    // simulation texture state, swapped each frame
+    uniform sampler2D state;
+
+    vec2 get(int x, int y) {
+        return vec2( 
+          texture2D( state, ( gl_FragCoord.xy + vec2(x, y) ) / resolution ).ra
+        );
+      }
+
+    vec2 laPlace() {
+        vec2 diagonals = .05 * (get(-1, -1).xy +
+        get(1, 1).xy +
+        get(1, -1).xy +
+        get(-1, 1).xy);
+  
+        vec2 adjacents = .2 * (get(0, -1).xy +
+        get(1, 0).xy +
+        get(-1, 0).xy +
+        get(0, 1)).xy;
+  
+        return (diagonals + adjacents - get(0, 0).xy);
+    }
+    
+    void main() 
+        {//simulation costants but not in the global scope
+        vec2 res = resolution;
+        float t = 1.0;
+        float dA = DiffusionA;
+        float dB = DiffusionB;
+        float _f = feed ;
+        float _k = kill;
+        float XpixPerPeriod = XPixelPerPeriod;
+        float XfeedWeight = XfeedWeight;
+        bool doXEffect = Xenabled;
+        float diffusionBPeriod = diffusionPeriod;
+        //wrong name but dont want to change it
+        float top_k = topKillValue;
+        float bottom_k = bottomKillValue; //0,0 is bottom left
+        bool killGradiant = toggleKillGradiant;
+        float diffBState = diffusionState;
+        float diffWeight = diffusionWeight;
+
+        if ( doXEffect){
+            _f += (cos((gl_FragCoord.x - gl_FragCoord.x/2.) / (XpixPerPeriod * 6.28)) * XfeedWeight) ;
+        }
+        float f = clamp(_f, 0.0, 1.0);
+
+        if(killGradiant){
+            _k = mix(bottom_k, top_k, (gl_FragCoord.y / res.y));
+        }
+        float k = clamp(_k, 0.0, 1.0);
+
+        if (diffBState == 2.){
+            dB += cos(time/diffusionBPeriod) * diffWeight;
+        } else if(diffBState == 1.){
+            dB += sin(time/diffusionBPeriod) * diffWeight;
+        }
+        dB = clamp(dB, 0.0, 1.0);
+
+        vec2 lpVal = laPlace();
+        vec2 OG_val = get(0,0);
+        float a = OG_val.y;
+        float b = OG_val.x;
+        float newA = a + t * ((dA * lpVal.y) - (a * b * b) + (f * (1.0 - a)));
+        float newB = b + t * ((dB * lpVal.x) + a * b * b - (k + f) * b);
+
+        float resA = clamp(newA, 0.0, 1.0);
+        float resB = clamp(newB, 0.0, 1.0);
+
+        gl_FragColor = vec4( resB, resB, resB, resA );
+    }
+  </script>
+
+  <!-- render to screen shader -->
+  <script id='render' type='x-shader/x-fragment'>
+    #ifdef GL_ES
+    precision mediump float;
+    #endif
+
+    uniform sampler2D uSampler;
+    uniform vec2 resolution;
+
+    void main() {
+      gl_FragColor = vec4( texture2D( uSampler, gl_FragCoord.xy / resolution).rgb, 1. );
+    }
+  </script>
+
+  <script type='text/javascript'>
+    let gl, framebuffer,
+        simulationProgram, drawProgram,
+        uTime, uSimulationState,
+        textureBack, textureFront,
+        dimensions = { width:null, height:null }
+
+    window.onload = function() {
+      const canvas = document.getElementById( 'gl' )
+      gl = canvas.getContext( 'webgl' )
+      canvas.width = dimensions.width = window.innerWidth
+      canvas.height = dimensions.height = window.innerHeight
+      
+      // define drawing area of webgl canvas. bottom corner, width / height
+      // XXX can't remember why we need the *2!
+      gl.viewport( 0,0, gl.drawingBufferWidth, gl.drawingBufferHeight )
+      
+      makeBuffer()
+      makeShaders()
+      makeTextures()
+
+      gl.useProgram(simulationProgram);
+
+      // textures loaded, now ready to render
+        const pane = new Tweakpane.Pane();
+        const paneTabs = pane.addTab({
+            pages: [
+                {title: 'Const'},
+                {title: 'Start'},
+                {title: 'Fun'}
+            ],
+        });
+
+        //FOLDERS
+        const folderX = paneTabs.pages[2].addFolder({
+            title: 'X Effexts',
+        });
+        const folderKillGradiant = paneTabs.pages[2].addFolder({
+            title: 'Kill Gradiant',
+        });
+        const folderDiffusion = paneTabs.pages[2].addFolder({
+            title: 'Diffusion B vs Time'
+        });
+
+        // paramiters for the reaction diffusion simulation
+        const ConstantsParams = {
+            DiffusionA: 0.71,
+            DiffusionB: 0.14,
+            feed: 0.055,
+            kill: 0.066,
+        };
+        // paramiters for the initial seeding state of the simulation
+        const StartingParams = {
+            RadiusOrWidth: 100,
+            startingState: 0
+        };
+        // X distortion effect params
+        const XParams = {
+            XPixPerPeriod: 10,
+            XfeedChangeWeight: 0.1,
+            Xenabled: false
+        };
+        // kill gradiant paramaters
+        const killGradiuantParms = {
+            Enabled: false,
+            topKillValue: 0.124,
+            bottomKillValue: 0.000
+        };
+        // Diffusion B vs time params
+        const diffusionParams = {
+            diffusionState: 0.,
+            diffusionPeriod: 100.,
+            diffusionWeight: 0.1
+        };
+
+        // default parameters input
+        const DiffusionA =  paneTabs.pages[0].addInput(ConstantsParams, 'DiffusionA', { label: 'Diffusion A',min:0.0, max:1.0});
+        const DiffusionB =  paneTabs.pages[0].addInput(ConstantsParams, 'DiffusionB', { label: 'Diffusion B',min:0.0, max:1.0});
+        const feed =  paneTabs.pages[0].addInput(ConstantsParams, 'feed', { label: 'Feed',min:0.0, max:.10});
+        const kill =  paneTabs.pages[0].addInput(ConstantsParams, 'kill', { label: 'Kill',min:0.0, max:.10});
+        // starting conditions input 
+        const Radius =  paneTabs.pages[1].addInput(StartingParams, 'RadiusOrWidth', {min:0, max:1000, step:1, label: 'Radius or Width',});
+        const StartStateList =  paneTabs.pages[1].addInput(StartingParams, 'startingState', {label: 'Starting State',options: {Circle: 0, BarVirtical: 1, BarHorizontal: 2,}});
+        // x distortion inputs
+        const Xenabled =  folderX.addInput(XParams, 'Xenabled', {label: 'Enabled'});
+        const PixelPerPeriodX =  folderX.addInput(XParams, 'XPixPerPeriod', {label: 'Pixel per X Period', min:1.0, max:50., step:1.0});
+        const feedWeightX =  folderX.addInput(XParams, 'XfeedChangeWeight', {label: 'Feed Distortion Weight', min:0.0, max:1.});
+        // kill gradiant inputs
+        const toggleKillGradiant = folderKillGradiant.addInput(killGradiuantParms, 'Enabled');
+        const topKillValue =  folderKillGradiant.addInput(killGradiuantParms, 'topKillValue', {label: 'Top Value', min:0.0, max:1.0});
+        const bottomKillValue =  folderKillGradiant.addInput(killGradiuantParms, 'bottomKillValue', {label: 'Bottom Value', min:0.0, max:1.0});
+        // difusioin b vs time inputs
+        const diffusionPeriod = folderDiffusion.addInput(diffusionParams, 'diffusionPeriod', {label: 'Time Period', min:1.0, max:1000.0, step:1.0});
+        const diffusionState = folderDiffusion.addInput(diffusionParams, 'diffusionState', {label: 'Disstortion Effect',options: {Disabled: 0., Sin: 1., Cos: 2.,},});
+        const diffusionWeight = folderDiffusion.addInput(diffusionParams, 'diffusionWeight', {label: 'Weight', min:.0, max:1.0});
+        
+        // prime the uniforms 
+        gl.useProgram(simulationProgram);
+        //default paramaters
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "DiffusionA"), ConstantsParams.DiffusionA);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "DiffusionB"), ConstantsParams.DiffusionB);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "feed"), ConstantsParams.feed);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "kill"), ConstantsParams.kill);
+        //x distortion uniforms
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "XPixelPerPeriod"), XParams.XPixPerPeriod);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "XfeedWeight"), XParams.XfeedChangeWeight);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "Xenabled"), XParams.Xenabled);
+        //kill gradiants uniforms
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "toggleKillGradiant"), killGradiuantParms.Enabled);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "topKillValue"), killGradiuantParms.topKillValue);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "bottomKillValue"), killGradiuantParms.bottomKillValue);
+        // diffusion b vs time uniforms
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "diffusionPeriod"), diffusionParams.diffusionPeriod);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "diffusionState"), diffusionParams.diffusionState);
+        gl.uniform1f(gl.getUniformLocation(simulationProgram, "diffusionWeight"), diffusionParams.diffusionWeight);
+
+        // reaction diffusion paramiters update functions
+        DiffusionA.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "DiffusionA"), ev.value);
+            console.log("DiffusionA:", ev.value);
+        })
+        DiffusionB.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "DiffusionB"), ev.value);
+            console.log("DiffusionB:", ev.value);
+        })
+        feed.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "feed"), ev.value);
+            console.log("feed:", ev.value);
+        })
+        kill.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "kill"), ev.value);
+            console.log("kill:", ev.value);
+        })
+        // x distortion paramiters update functions
+        PixelPerPeriodX.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "XPixelPerPeriod"), ev.value);
+            console.log("PixelPerPeriod:", ev.value);
+        })
+        feedWeightX.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "XfeedWeight"), ev.value);
+            console.log("feedWeight:", ev.value);
+        })
+        Xenabled.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "Xenabled"), ev.value);
+            console.log("Xenabled:", ev.value);
+        })
+        // kill gradiant
+        toggleKillGradiant.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "toggleKillGradiant"), ev.value);
+            console.log("toggleKillGradiant:", ev.value);
+        })
+        topKillValue.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "topKillValue"), ev.value);
+            console.log("topKillValue:", ev.value);
+        })
+        bottomKillValue.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "bottomKillValue"), ev.value);
+            console.log("bottomKillValue:", ev.value);
+        })
+        // diffussin B vs time 
+        diffusionPeriod.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "diffusionPeriod"), ev.value);
+            console.log("diffusionPeriod:", ev.value);
+        })
+        diffusionState.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "diffusionState"), ev.value);
+            console.log("diffusionState:", ev.value);
+        })
+        diffusionWeight.on("change", (ev)=>{
+            gl.useProgram(simulationProgram);
+            gl.uniform1f(gl.getUniformLocation(simulationProgram, "diffusionWeight"), ev.value);
+            console.log("diffusionWeight:", ev.value);
+        })
+        
+        //GLOBAL INPUTS
+        // reset button
+        const btn = pane.addButton({
+            title: 'Restart WARN: Laggy'
+        });
+
+        btn.on('click', () => {
+            setInitialState(StartingParams.RadiusOrWidth, StartingParams.startingState)
+        });
+
+        // make a persets button
+        const presetParams = {
+            persetValue: 0.
+        };
+        const Presets = pane.addInput(
+            presetParams,
+            "persetValue",
+            {
+            label: 'Preset', 
+            options:    {Default:               0.,
+                        Living_Pillars:         1., 
+                        Shocked_Eyes:           2., 
+                        Moldy_Trees:            3., 
+                        Stop_And_Start:         4.,
+                        X_Effect_DEMO:          5.,
+                        Kill_Gradient_DEMO:     6.,
+                        Diffusion_vs_Time_DEMO: 7.,}
+            }
+        );
+            
+
+        Presets.on('change', (ev) => {
+            switch(ev.value){
+                case 0.0: //default
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 100
+                    StartingParams.startingState = 0
+                    //base params
+                    ConstantsParams.DiffusionA = 0.71
+                    ConstantsParams.DiffusionB = 0.14
+                    ConstantsParams.feed = 0.055
+                    ConstantsParams.kill = 0.066
+                    // x feed params
+                    XParams.Xenabled = false
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.1
+                    // kill gradiant
+                    killGradiuantParms.Enabled = false
+                    killGradiuantParms.topKillValue = 0.124
+                    killGradiuantParms.bottomKillValue = 0.0
+                    // diffusion
+                    diffusionParams.diffusionPeriod = 100.0
+                    diffusionParams.diffusionState = 0.0
+                    diffusionParams.diffusionWeight = 0.1
+                break;
+                case 1.0: //living pillars
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 100
+                    StartingParams.startingState = 2
+                    //base params
+                    ConstantsParams.DiffusionA = 0.99
+                    ConstantsParams.DiffusionB = 0.10
+                    ConstantsParams.feed = 0.075
+                    ConstantsParams.kill = 0.062
+                    // x feed params
+                    XParams.Xenabled = true
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.1
+                    // kill gradiant
+                    killGradiuantParms.Enabled = false
+                    killGradiuantParms.topKillValue = 0.124
+                    killGradiuantParms.bottomKillValue = 0.0
+                    // diffusion
+                    diffusionParams.diffusionPeriod = 100.0
+                    diffusionParams.diffusionState = 1.0
+                    diffusionParams.diffusionWeight = 0.2
+                break;
+                case 2.0: //shocked eyes
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 100
+                    StartingParams.startingState = 2
+                    //base params
+                    ConstantsParams.DiffusionA = 0.99
+                    ConstantsParams.DiffusionB = 0.75
+                    ConstantsParams.feed = 0.092
+                    ConstantsParams.kill = 0.034
+                    // x feed params
+                    XParams.Xenabled = true
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.1
+                    // kill gradiant
+                    killGradiuantParms.Enabled = false
+                    killGradiuantParms.topKillValue = 0.124
+                    killGradiuantParms.bottomKillValue = 0.0
+                    // diffusion
+                    diffusionParams.diffusionPeriod = 100.0
+                    diffusionParams.diffusionState = 1.0
+                    diffusionParams.diffusionWeight = 0.2
+                break;
+                case 3.0: // moldy tree
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 100
+                    StartingParams.startingState = 1
+                    //base params
+                    ConstantsParams.DiffusionA = 0.74
+                    ConstantsParams.DiffusionB = 0.13
+                    ConstantsParams.feed = 0.068
+                    ConstantsParams.kill = 0.0
+                    // x feed params
+                    XParams.Xenabled = false
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.1
+                    // kill gradiant
+                    killGradiuantParms.Enabled = true
+                    killGradiuantParms.topKillValue = 0.124
+                    killGradiuantParms.bottomKillValue = 0.05
+                    // diffusion v time
+                    diffusionParams.diffusionPeriod = 100.0
+                    diffusionParams.diffusionState = 0.0
+                    diffusionParams.diffusionWeight = 0.2
+                break;
+                case 4.0: //stop and go
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 10
+                    StartingParams.startingState = 1
+                    //base params
+                    ConstantsParams.DiffusionA = 0.99
+                    ConstantsParams.DiffusionB = 0.1
+                    ConstantsParams.feed = 0.075
+                    ConstantsParams.kill = 0.062
+                    // x feed params
+                    XParams.Xenabled = true
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.01
+                    // kill gradiant
+                    killGradiuantParms.Enabled = true
+                    killGradiuantParms.topKillValue = 0.1
+                    killGradiuantParms.bottomKillValue = 0.06
+                    // diffusion v time
+                    diffusionParams.diffusionPeriod = 20.0
+                    diffusionParams.diffusionState = 1.0
+                    diffusionParams.diffusionWeight = 0.2
+                break;
+                case 5.0: // x effect demo
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 250
+                    StartingParams.startingState = 0
+                    //base params
+                    ConstantsParams.DiffusionA = 0.71
+                    ConstantsParams.DiffusionB = 0.14
+                    ConstantsParams.feed = 0.055
+                    ConstantsParams.kill = 0.066
+                    // x feed params
+                    XParams.Xenabled = true
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.05
+                    // kill gradiant
+                    killGradiuantParms.Enabled = false
+                    killGradiuantParms.topKillValue = 0.124
+                    killGradiuantParms.bottomKillValue = 0.0
+                    // diffusion
+                    diffusionParams.diffusionPeriod = 100.0
+                    diffusionParams.diffusionState = 0.0
+                    diffusionParams.diffusionWeight = 0.1
+                break;
+                case 6.0: // Kill gradiant demo
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 250
+                    StartingParams.startingState = 0
+                    //base params
+                    ConstantsParams.DiffusionA = 0.71
+                    ConstantsParams.DiffusionB = 0.14
+                    ConstantsParams.feed = 0.04
+                    ConstantsParams.kill = 0.0
+                    // x feed params
+                    XParams.Xenabled = false
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.05
+                    // kill gradiant
+                    killGradiuantParms.Enabled = true
+                    killGradiuantParms.topKillValue = 0.08
+                    killGradiuantParms.bottomKillValue = 0.04
+                    // diffusion
+                    diffusionParams.diffusionPeriod = 100.0
+                    diffusionParams.diffusionState = 0.0
+                    diffusionParams.diffusionWeight = 0.1
+                break;
+                case 7.0: // diffussion B vs time
+                    // seeding params
+                    StartingParams.RadiusOrWidth = 250
+                    StartingParams.startingState = 0
+                    //base params
+                    ConstantsParams.DiffusionA = 0.83
+                    ConstantsParams.DiffusionB = 0.25
+                    ConstantsParams.feed = 0.055
+                    ConstantsParams.kill = 0.066
+                    // x feed params
+                    XParams.Xenabled = false
+                    XParams.XPixPerPeriod = 10
+                    XParams.XfeedChangeWeight = 0.05
+                    // kill gradiant
+                    killGradiuantParms.Enabled = false
+                    killGradiuantParms.topKillValue = 0.08
+                    killGradiuantParms.bottomKillValue = 0.04
+                    // diffusion
+                    diffusionParams.diffusionPeriod = 100.0
+                    diffusionParams.diffusionState = 1.0
+                    diffusionParams.diffusionWeight = 0.15
+                break;
+            }
+            DiffusionA.refresh()
+            DiffusionB.refresh()
+            feed.refresh()
+            kill.refresh()
+            Xenabled.refresh()
+            PixelPerPeriodX.refresh()
+            feedWeightX.refresh()
+            toggleKillGradiant.refresh()
+            topKillValue.refresh()
+            bottomKillValue.refresh()
+            diffusionPeriod.refresh()
+            diffusionWeight.refresh()
+            diffusionState.refresh()
+            Radius.refresh()
+            StartStateList.refresh()
+
+            setInitialState(StartingParams.RadiusOrWidth, StartingParams.startingState)
+        });
+
+        setInitialState(StartingParams.RadiusOrWidth, StartingParams.startingState)
+        render()
+        
+    }//on load end
+    
+    function poke( x, y, valueA, valueB, texture ) {   
+        gl.bindTexture( gl.TEXTURE_2D, texture )
+        
+        // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/texSubImage2D
+        gl.texSubImage2D( 
+            gl.TEXTURE_2D, 0, 
+            // x offset, y offset, width, height
+            x, y, 1, 1,
+            gl.RGBA, gl.UNSIGNED_BYTE,
+            // is supposed to be a typed array
+            new Uint8Array([valueB,valueB,valueB,valueA])
+        )
+    }
+
+    function setInitialState(radius, state) {
+        let width = dimensions.width, height = dimensions.height
+        
+        console.log("STARTING:Setting Intital State")
+        console.log("Start State: ", state)
+        switch(state){
+            case 0://circle
+                for( i = 0; i < dimensions.width; i++ ) {
+                        for( j = 0; j < dimensions.height; j++ ) {
+                            centerI = i - width/2
+                            centerJ = j - height/2
+                            if(Math.sqrt(centerI*centerI + centerJ*centerJ) < radius) {
+                                poke( i, j, 255, 255, textureBack )
+                            }else{
+                                poke( i, j, 255, 0, textureBack )
+                            }
+                    }
+                }
+            break;
+            case 1:
+                for( i = 0; i < dimensions.width; i++ ) {
+                        for( j = 0; j < dimensions.height; j++ ) {
+                            centerI = i - width/2
+                            centerJ = j - height/2
+                            if(Math.abs(centerI) < radius) {
+                                poke( i, j, 255, 255, textureBack )
+                            }else{
+                                poke( i, j, 255, 0, textureBack )
+                            }
+                    }
+                }
+            break;
+            case 2://horizontal bar
+                for( i = 0; i < dimensions.width; i++ ) {
+                        for( j = 0; j < dimensions.height; j++ ) {
+                            centerI = i - width/2
+                            centerJ = j - height/2
+                            if(Math.abs(centerJ) < radius) {
+                                poke( i, j, 255, 255, textureBack )
+                            }else{
+                                poke( i, j, 255, 0, textureBack )
+                            }
+                    }
+                }
+            break;
+        }
+        console.log("DONE:Setting Intital State")
+        time = 0
+    }
+
+    function makeBuffer() {
+      // create a buffer object to store vertices
+      const buffer = gl.createBuffer()
+
+      // point buffer at graphic context's ARRAY_BUFFER
+      gl.bindBuffer( gl.ARRAY_BUFFER, buffer )
+
+      const triangles = new Float32Array([
+        -1, -1,
+         1, -1,
+        -1,  1,
+        -1,  1,
+         1, -1,
+         1,  1
+      ])
+
+      // initialize memory for buffer and populate it. Give
+      // open gl hint contents will not change dynamically.
+      gl.bufferData( gl.ARRAY_BUFFER, triangles, gl.STATIC_DRAW )
+    }
+    
+    function makeShaders() {
+      // create vertex shader
+      let shaderScript = document.getElementById('vertex')
+      let shaderSource = shaderScript.text
+      const vertexShader = gl.createShader( gl.VERTEX_SHADER )
+      gl.shaderSource( vertexShader, shaderSource )
+      gl.compileShader( vertexShader )
+
+      // create fragment shader
+      shaderScript = document.getElementById('render')
+      shaderSource = shaderScript.text
+      const drawFragmentShader = gl.createShader( gl.FRAGMENT_SHADER )
+      gl.shaderSource( drawFragmentShader, shaderSource )
+      gl.compileShader( drawFragmentShader )
+      console.log( gl.getShaderInfoLog(drawFragmentShader) )
+      
+      // create render program that draws to screen
+      drawProgram = gl.createProgram()
+      gl.attachShader( drawProgram, vertexShader )
+      gl.attachShader( drawProgram, drawFragmentShader )
+
+      gl.linkProgram( drawProgram )
+      gl.useProgram( drawProgram )
+      
+      uRes = gl.getUniformLocation( drawProgram, 'resolution' )
+      gl.uniform2f( uRes, gl.drawingBufferWidth, gl.drawingBufferHeight )
+
+      // get position attribute location in shader
+      let position = gl.getAttribLocation( drawProgram, 'a_position' )
+      // enable the attribute
+      gl.enableVertexAttribArray( position )
+      // this will point to the vertices in the last bound array buffer.
+      // In this example, we only use one array buffer, where we're storing 
+      // our vertices
+      gl.vertexAttribPointer( position, 2, gl.FLOAT, false, 0,0 )
+      
+      shaderScript = document.getElementById('simulation')
+      shaderSource = shaderScript.text
+      const simulationFragmentShader = gl.createShader( gl.FRAGMENT_SHADER )
+      gl.shaderSource( simulationFragmentShader, shaderSource )
+      gl.compileShader( simulationFragmentShader )
+      console.log( gl.getShaderInfoLog( simulationFragmentShader ) )
+      
+      // create simulation program
+      simulationProgram = gl.createProgram()
+      gl.attachShader( simulationProgram, vertexShader )
+      gl.attachShader( simulationProgram, simulationFragmentShader )
+
+      gl.linkProgram( simulationProgram )
+      gl.useProgram( simulationProgram )
+      
+      uRes = gl.getUniformLocation( simulationProgram, 'resolution' )
+      gl.uniform2f( uRes, gl.drawingBufferWidth, gl.drawingBufferHeight )
+      
+      // find a pointer to the uniform "time" in our fragment shader
+      uTime = gl.getUniformLocation( simulationProgram, 'time' )
+      
+      //uSimulationState = gl.getUniformLocation( simulationProgram, 'state' )
+
+      position = gl.getAttribLocation( simulationProgram, 'a_position' )
+      gl.enableVertexAttribArray( simulationProgram )
+      gl.vertexAttribPointer( position, 2, gl.FLOAT, false, 0,0 )
+    }
+    
+    function makeTextures() {
+      textureBack = gl.createTexture()
+      gl.bindTexture( gl.TEXTURE_2D, textureBack )
+      
+      // these two lines are needed for non-power-of-2 textures
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE )
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE )
+      
+      // how to map when texture element is less than one pixel
+      // use gl.NEAREST to avoid linear interpolation
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST )
+      // how to map when texture element is more than one pixel
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+      
+      // specify texture format, see https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/texImage2D
+      gl.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA, dimensions.width, dimensions.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null )
+  
+      textureFront = gl.createTexture()
+      gl.bindTexture( gl.TEXTURE_2D, textureFront )
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE )
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE )
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST )
+      gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST )
+      gl.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA, dimensions.width, dimensions.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null )
+
+      // Create a framebuffer and attach the texture.
+      framebuffer = gl.createFramebuffer()
+      
+    }
+
+    // keep track of time via incremental frame counter
+    let time = 0
+    function render() {
+      // schedules render to be called the next time the video card requests 
+      // a frame of video
+      window.requestAnimationFrame( render )
+      
+      // use our simulation shader
+      gl.useProgram( simulationProgram )  
+      // update time on CPU and GPU
+      time++
+      gl.uniform1f( uTime, time )     
+      gl.bindFramebuffer( gl.FRAMEBUFFER, framebuffer )
+      // use the framebuffer to write to our texFront texture
+      gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, textureFront, 0 )
+      // set viewport to be the size of our state (game of life simulation)
+      // here, this represents the size that will be drawn onto our texture
+      gl.viewport(0, 0, dimensions.width,dimensions.height )
+      
+      // in our shaders, read from texBack, which is where we poked to
+      gl.activeTexture( gl.TEXTURE0 )
+      gl.bindTexture( gl.TEXTURE_2D, textureBack )
+      gl.uniform1i( uSimulationState, 0 )
+      // run shader
+      gl.drawArrays( gl.TRIANGLES, 0, 6 )
+  
+      // swap our front and back textures
+      let tmp = textureFront
+      textureFront = textureBack
+      textureBack = tmp
+
+      // use the default framebuffer object by passing null
+      gl.bindFramebuffer( gl.FRAMEBUFFER, null )
+      // set our viewport to be the size of our canvas
+      // so that it will fill it entirely
+      gl.viewport(0, 0, dimensions.width,dimensions.height )
+      // select the texture we would like to draw to the screen.
+      // note that webgl does not allow you to write to / read from the
+      // same texture in a single render pass. Because of the swap, we're
+      // displaying the state of our simulation ****before**** this render pass (frame)
+      gl.bindTexture( gl.TEXTURE_2D, textureFront )
+      // use our drawing (copy) shader
+      gl.useProgram( drawProgram )
+      // put simulation on screen
+      gl.drawArrays( gl.TRIANGLES, 0, 6 )
+    }
+  </script>
+
+</html>
