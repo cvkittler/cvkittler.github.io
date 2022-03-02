@@ -138,36 +138,19 @@
     // dir - heading of agent
     // angle - direction to sense, in radians
     // distance - distance to sense
-    float readSensor( vec2 pos, vec2 dir, float angle, vec2 distance ) {
+    float readSensor( vec2 pos, vec2 dir, float angle, vec2 distance, float _time, float _senseGreenWeight) {
       vec2 newangle  = rotate( dir, angle  );
       vec2 offset = newangle * distance;
       vec2 lookLocation = pos + offset;
 
-      // sense wrap around
-      if(lookLocation.x > 1.0){
-        lookLocation.x -= 1.0;
-      }
-      if(lookLocation.x < 0.0){
-        lookLocation.x += 1.0;
-      }
-      if(lookLocation.y > 1.0){
-        lookLocation.y -= 1.0;
-      }
-      if(lookLocation.y < 0.0){
-        lookLocation.y += 1.0;
-      }
       float greenValue = texture( uSampler,  lookLocation).g;
       float redValue = texture( uSampler,  lookLocation).r;
-      if (invertGreen){
-        float timeDouble = (time * 2.);
-        if (mod(timeDouble, invertGreenPeriod) > invertGreenPeriod){
-          greenValue = greenValue * -1.;
-        } 
-      }
-      return greenValue * senseGreenWeight + redValue * senseRedWeight;
+      return greenValue * _senseGreenWeight + redValue * senseRedWeight;
     }
+
     void main() {
       float _time = time;
+      float invertGreenPeriod = invertGreenPeriod;
       // get normalied height / width of a single pixel 
       vec2 pixel = 1. / resolution;
     
@@ -176,11 +159,20 @@
 
       // normalize our {-1,1} vertex coordinates to {0,1} for texture lookups
       vec2 pos = (1. + a_pos.xy) / 2.;
-    
+      
+      
+      float _senseGreenWeight = senseGreenWeight;
+      if (invertGreen){
+        float remainder = mod(_time, invertGreenPeriod);
+        float halfPeriod = invertGreenPeriod / 2.;
+        float conditional = (remainder < halfPeriod) ? -1. : 1.;
+        _senseGreenWeight = _senseGreenWeight * conditional;
+      }
+
       // read sensor informatino at different angles
-      float left     = readSensor( pos, a_pos.zw, -RAD_DEGREE_COEFF * 45., sensorDistance );
-      float forward  = readSensor( pos, a_pos.zw, 0.,    sensorDistance );
-      float right    = readSensor( pos, a_pos.zw, RAD_DEGREE_COEFF * 45.5,  sensorDistance );
+      float left     = readSensor( pos, a_pos.zw, -RAD_DEGREE_COEFF * 45., sensorDistance, _time, _senseGreenWeight);
+      float forward  = readSensor( pos, a_pos.zw, 0.,    sensorDistance, _time, _senseGreenWeight );
+      float right    = readSensor( pos, a_pos.zw, RAD_DEGREE_COEFF * 45.5,  sensorDistance, _time, _senseGreenWeight );
       
       // initialize feedback transform output
       o_vpos = a_pos;
@@ -256,7 +248,7 @@
         copyProgram, simulationProgram, quad,
         dimensions = { width:null, height:null },
         agentCount = 3000000, ddProgram,ddPosition,PANE_PARMAS,
-        distGraph
+        alphaMonitor, decayMonitorR, decayMonitorG, decayMonitorB, decayMonitorA, senseValue
 
     window.onload = function() {
         const canvas = document.getElementById( 'gl' )
@@ -279,25 +271,32 @@
     function makeTweakPane(){
       const pane = new Tweakpane.Pane();
         PANE_PARMAS = {
-          decay: {x:0.0,y:0.0,z:0.0,w:0.0},
+          decay: {x:0.05,y:0.00,z:0.0,w:0.0},
           decayPeriod: 700,
-          decayWeights: {x:0.1,y:0.1,z:0.1,w:0.1},
+          decayWeights: {x:0.05,y:0.05,z:0.05,w:0.00},
           agentAlpha: 0.25,
           periodAlpha: 500,
           weightAlpha: .10,
-          senseRedWeight: 1.0,
-          senseGreenWeight: -0.2,
+          senseRedWeight: .2,
+          senseGreenWeight: 1,
           invertGreen: true,
-          invertGreenPeriod: 300
+          invertGreenPeriod: 1000,
+
+          curAlpha: 0,
+          curDecayR: 0.0,
+          curDecayG: 0.0,
+          curDecayB: 0.0,
+          curDecayA: 0.0,
+          curSenseValue: 0
         };
         const EffectsFolder = pane.addFolder({
-          title: 'Alpha Effect', expanded: true
+          title: 'Effects', expanded: false
         })
         const alphaFolder = EffectsFolder.addFolder({
-          title: 'Alpha Effect', expanded: false
+          title: 'Agent Alpha', expanded: false
         })
         const DecayFolder = EffectsFolder.addFolder({
-          title: 'Decay Effect', expanded: false
+          title: 'Color Decay Rate', expanded: false
         })
         const SenseingFolder = EffectsFolder.addFolder({
           title: 'Sensing Effect', expanded: false
@@ -317,6 +316,13 @@
         const invertGreenPeriod_inpout = SenseingFolder.addInput(PANE_PARMAS, 'invertGreenPeriod', {label: "Invert Period"});
 
         const resetButton = pane.addButton({title: 'Restart'});
+        //make monitors
+        alphaMonitor = alphaFolder.addMonitor(PANE_PARMAS, 'curAlpha', {label:"Current"});
+        decayMonitorR = DecayFolder.addMonitor(PANE_PARMAS, 'curDecayR', {label:"Current Red"});
+        decayMonitorG = DecayFolder.addMonitor(PANE_PARMAS, 'curDecayG', {label:"Current Green"});
+        decayMonitorB = DecayFolder.addMonitor(PANE_PARMAS, 'curDecayB', {label:"Current Blue"});
+        decayMonitorA = DecayFolder.addMonitor(PANE_PARMAS, 'curDecayA', {label:"Current Alpha"});
+        senseValue = SenseingFolder.addMonitor(PANE_PARMAS, 'curSenseValue', {label:"Current"});
         // diffussion params 
         gl.useProgram(ddProgram);
 
@@ -616,6 +622,12 @@
       // Create a framebuffer and attach the texture.
       framebuffer = gl.createFramebuffer()
     }
+    function clamp(num, min, max){
+      return Math.min(Math.max(num,min), max)
+    }
+    function step(a, b){
+      return a < b ? 0 : 1;
+    }
     // keep track of time via incremental frame counter
     let time = 0
     function render() {
@@ -626,6 +638,28 @@
         time++
         gl.uniform1f( uTime, time )
         
+        /* Update tweakpane monitors */
+        PANE_PARMAS.curAlpha = PANE_PARMAS.agentAlpha + (PANE_PARMAS.weightAlpha * Math.cos(time/PANE_PARMAS.periodAlpha))
+        PANE_PARMAS.curDecayR = clamp(PANE_PARMAS.decay.x + (PANE_PARMAS.decayWeights.x * Math.sin(time/PANE_PARMAS.decayPeriod)), 0.0, 1.0)
+        PANE_PARMAS.curDecayG = clamp(PANE_PARMAS.decay.y + (PANE_PARMAS.decayWeights.y * Math.sin(time/PANE_PARMAS.decayPeriod)), 0.0, 1.0)
+        PANE_PARMAS.curDecayB = clamp(PANE_PARMAS.decay.z + (PANE_PARMAS.decayWeights.z * Math.sin(time/PANE_PARMAS.decayPeriod)), 0.0, 1.0)
+        PANE_PARMAS.curDecayA = clamp(PANE_PARMAS.decay.w + (PANE_PARMAS.decayWeights.w * Math.sin(time/PANE_PARMAS.decayPeriod)), 0.0, 1.0)
+        if (PANE_PARMAS.invertGreen){
+          if (step((time % PANE_PARMAS.invertGreenPeriod), PANE_PARMAS.invertGreenPeriod / 2.) == 0.0){
+            PANE_PARMAS.curSenseValue = PANE_PARMAS.senseGreenWeight * -1.;
+          } else {
+            PANE_PARMAS.curSenseValue = PANE_PARMAS.senseGreenWeight
+          }
+        } else {
+          PANE_PARMAS.curSenseValue = PANE_PARMAS.senseGreenWeight
+        }
+        alphaMonitor.refresh()
+        decayMonitorR.refresh()
+        decayMonitorG.refresh()
+        decayMonitorB.refresh()
+        decayMonitorA.refresh()
+        senseValue.refresh()
+
         gl.bindFramebuffer( gl.FRAMEBUFFER, framebuffer )
 
         // use the framebuffer to write to our textureFront texture
